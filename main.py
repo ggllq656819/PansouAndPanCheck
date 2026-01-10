@@ -1,0 +1,207 @@
+import os
+import logging
+import time
+from collections import Counter
+
+import httpx
+from fastapi import FastAPI, Request, HTTPException
+
+# 配置日志
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+
+# 环境变量配置
+SEARCH_API_URL = os.getenv("SEARCH_API_URL", "http://127.0.0.1:8888")
+CHECK_API_URL = os.getenv("CHECK_API_URL", "http://127.0.0.1/api/v1/links/check")
+
+
+async def filter_search_results(search_data, client, request_type="POST"):
+    """过滤搜索结果的通用函数"""
+    # 1. 收集所有需要校验的链接 (去重)
+    unique_links = set()
+
+    # 处理 merged_by_type 结构
+    merged_by_type = search_data.get("data", {}).get("merged_by_type", {})
+    for netdisk_type, links in merged_by_type.items():
+        for item in links:
+            unique_links.add(item["url"])
+
+    # 处理 results 结构
+    results = search_data.get("data", {}).get("results", [])
+    for res in results:
+        for link_obj in res.get("links", []):
+            unique_links.add(link_obj["url"])
+
+    if not unique_links:
+        logger.info(f"{request_type}请求：无链接需要验证，返回原始数据")
+        return search_data
+
+    # 记录过滤前的总数
+    total_before_filter = len(unique_links)
+    logger.info(f"{request_type}请求：开始验证 {total_before_filter} 个唯一链接")
+
+    # 2. 调用校验接口过滤无效数据
+    start_time = time.time()
+    valid_links_set = set()
+
+    try:
+        check_res = await client.post(CHECK_API_URL, json={
+            "links": list(unique_links),
+            "selected_platforms": ["quark", "uc", "baidu", "tianyi", "pan123", "pan115", "xunlei", "aliyun"]
+        })
+        check_res.raise_for_status()  # 确保HTTP状态码正常
+        check_data = check_res.json()
+        valid_links_set = set(check_data.get("valid_links", []))
+    except Exception as e:
+        logger.warning(f"{request_type}请求：验证API错误: {str(e)}，跳过验证")
+        # 如果校验接口失效，放行所有结果以防搜索完全不可用
+        valid_links_set = unique_links
+
+    end_time = time.time()
+    filter_duration = end_time - start_time
+
+    # 统计各网盘过滤情况
+    # 重新统计各个网盘类型的数据量
+    original_counts = Counter()
+    filtered_counts = Counter()
+
+    # 统计原始数据
+    for netdisk_type, links in merged_by_type.items():
+        original_counts[netdisk_type] += len(links)
+
+    for res in results:
+        for link_obj in res.get("links", []):
+            if 'netdisk_type' in link_obj:  # 假设链接对象中有网盘类型字段
+                original_counts[link_obj['netdisk_type']] += 1
+            else:
+                # 如果没有明确的网盘类型，尝试从URL推断或其他方式确定
+                original_counts['unknown'] += 1
+
+    # 过滤 merged_by_type 并统计过滤后的数量
+    new_merged = {}
+    for netdisk_type, links in merged_by_type.items():
+        filtered_links = [l for l in links if l["url"] in valid_links_set]
+        if filtered_links:
+            new_merged[netdisk_type] = filtered_links
+        filtered_counts[netdisk_type] = len(filtered_links)
+
+    # 过滤 results 并统计过滤后的数量
+    new_results = []
+    for res in results:
+        # 仅保留有效的链接对象
+        original_result_links_count = len(res.get("links", []))
+        filtered_result_links = [l for l in res.get("links", []) if l["url"] in valid_links_set]
+        filtered_result_links_count = len(filtered_result_links)
+
+        if filtered_result_links:  # 如果该条目还有有效链接，则保留该条目
+            res_copy = res.copy()
+            res_copy["links"] = filtered_result_links
+            new_results.append(res_copy)
+
+        # 统计结果中的网盘类型（如果存在）
+        if 'netdisk_type' in res:
+            original_counts[res['netdisk_type']] += original_result_links_count
+            filtered_counts[res['netdisk_type']] += filtered_result_links_count
+        else:
+            original_counts['unknown'] += original_result_links_count
+            filtered_counts['unknown'] += filtered_result_links_count
+
+    # 计算总的过滤统计
+    total_after_filter = sum(filtered_counts.values())
+    total_filtered_out = total_before_filter - len(valid_links_set)
+
+    # 打印详细日志
+    logger.info(f"{request_type}请求：过滤完成，耗时 {filter_duration:.2f}秒")
+    logger.info(
+        f"{request_type}请求 - 过滤前链接数: {total_before_filter}, 过滤后链接数: {len(valid_links_set)}, 过滤掉: {total_filtered_out}")
+
+    for netdisk_type in original_counts.keys():
+        original_count = original_counts[netdisk_type]
+        filtered_count = filtered_counts[netdisk_type]
+        logger.info(
+            f"{request_type}请求 - 网盘 {netdisk_type}: {original_count} -> {filtered_count} (过滤: {original_count - filtered_count})")
+
+    # 构建最终响应，保持与 pansou 一致
+    final_response = {
+        "total": len(new_results) if new_results else len(valid_links_set),  # 简单估算总数
+        "results": new_results,
+        "merged_by_type": new_merged
+    }
+
+    return final_response
+
+
+@app.post("/api/search")
+async def proxy_search(request: Request):
+    # 1. 获取原始请求参数
+    body = await request.json()
+    if "kw" not in body:
+        raise HTTPException(status_code=400, detail="缺少必需字段: kw")
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        # 2. 调用原始 pansou 接口获取数据
+        try:
+            search_res = await client.post(f"{SEARCH_API_URL}/api/search", json=body)
+            search_res.raise_for_status()  # 确保HTTP状态码正常
+            search_data = search_res.json()
+        except httpx.ConnectError:
+            logger.error(f"无法连接到搜索API: {SEARCH_API_URL}")
+            raise HTTPException(status_code=503, detail=f"无法连接到搜索API: {SEARCH_API_URL}")
+        except httpx.TimeoutException:
+            logger.error("搜索API请求超时")
+            raise HTTPException(status_code=408, detail="搜索API请求超时")
+        except Exception as e:
+            logger.error(f"搜索API错误: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"搜索API错误: {str(e)}")
+
+        # 使用通用的过滤函数处理结果
+        return await filter_search_results(search_data, client, "POST")
+
+
+# 支持 GET 请求透传
+@app.get("/api/search")
+async def proxy_search_get(request: Request):
+    params = dict(request.query_params)
+    # 将查询参数转换为适合搜索API的格式
+    search_params = {
+        "kw": params.get("kw", ""),
+        "res": params.get("res", "merge"),
+        "src": params.get("src", "")
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        # 2. 调用原始 pansou 接口获取数据
+        try:
+            search_res = await client.get(f"{SEARCH_API_URL}/api/search", params=search_params)
+            search_res.raise_for_status()  # 确保HTTP状态码正常
+            search_data = search_res.json()
+        except httpx.ConnectError:
+            logger.error(f"无法连接到搜索API: {SEARCH_API_URL}")
+            raise HTTPException(status_code=503, detail=f"无法连接到搜索API: {SEARCH_API_URL}")
+        except httpx.TimeoutException:
+            logger.error("搜索API请求超时")
+            raise HTTPException(status_code=408, detail="搜索API请求超时")
+        except Exception as e:
+            logger.error(f"搜索API错误: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"搜索API错误: {str(e)}")
+
+        # 使用通用的过滤函数处理结果
+        return await filter_search_results(search_data, client, "GET")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    import asyncio
+
+    # 使用兼容的方式运行uvicorn
+    config = uvicorn.Config(app, host="0.0.0.0", port=1566)
+    server = uvicorn.Server(config)
+
+    # 在Windows环境下使用兼容的事件循环
+    if os.name == "nt":  # Windows系统
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+    # 直接运行服务器而不是使用uvicorn.run
+    asyncio.run(server.serve())
