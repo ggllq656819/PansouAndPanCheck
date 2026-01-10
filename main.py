@@ -190,6 +190,25 @@ async def proxy_search_get(request: Request):
         # 使用通用的过滤函数处理结果
         return await filter_search_results(search_data, client, "GET")
 
+@app.get("/api/health")
+async def health():
+    """pansou健康检查接口"""
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        # 2. 调用原始 pansou 接口获取数据
+        try:
+            search_res = await client.get(f"{SEARCH_API_URL}/api/health")
+            search_res.raise_for_status()  # 确保HTTP状态码正常
+            return search_res.json()
+        except httpx.ConnectError:
+            logger.error(f"无法连接到健康检查API: {SEARCH_API_URL}")
+            raise HTTPException(status_code=503, detail=f"无法连接到健康检查API: {SEARCH_API_URL}")
+        except httpx.TimeoutException:
+            logger.error("健康检查API请求超时")
+            raise HTTPException(status_code=408, detail="健康检查API请求超时")
+        except Exception as e:
+            logger.error(f"健康检查API错误: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"健康检查API错误: {str(e)}")
+
 
 if __name__ == "__main__":
     import uvicorn
