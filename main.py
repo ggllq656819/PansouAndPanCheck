@@ -1,25 +1,27 @@
 import os
 import logging
 import time
+import json
 from collections import Counter
-from json import JSONDecodeError
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
-from fastapi import FastAPI, Request, HTTPException
+from flask import Flask, request, jsonify, make_response
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
+app = Flask(__name__)
 
 # 环境变量配置
 SEARCH_API_URL = os.getenv("SEARCH_API_URL", "http://127.0.0.1:8888")
 CHECK_API_URL = os.getenv("CHECK_API_URL", "http://127.0.0.1/api/v1/links/check")
 
 
-async def filter_search_results(search_data, client, request_type="POST"):
-    """过滤搜索结果的通用函数"""
+def filter_search_results_sync(search_data, client, request_type="POST"):
+    """同步版本的过滤搜索结果函数"""
     # 1. 收集所有需要校验的链接 (去重)
     unique_links = set()
 
@@ -48,10 +50,12 @@ async def filter_search_results(search_data, client, request_type="POST"):
     valid_links_set = set()
 
     try:
-        check_res = await client.post(CHECK_API_URL, json={
+        # 同步发送请求
+        response_data = {
             "links": list(unique_links),
             "selected_platforms": ["quark", "uc", "baidu", "tianyi", "pan123", "pan115", "xunlei", "aliyun"]
-        }, headers={"Content-Type": "application/json; charset=utf-8"})
+        }
+        check_res = client.post(CHECK_API_URL, json=response_data)
         check_res.raise_for_status()  # 确保HTTP状态码正常
         check_data = check_res.json()
         valid_links_set = set(check_data.get("valid_links", []))
@@ -148,111 +152,100 @@ async def filter_search_results(search_data, client, request_type="POST"):
     return final_response
 
 
-@app.post("/api/search")
-async def proxy_search(request: Request):
+@app.route('/api/search', methods=['POST'])
+def proxy_search():
     # 1. 获取原始请求参数
     try:
-        # 检查请求体是否为空
-        body_bytes = await request.body()
+        # 获取内容类型
+        content_type = request.content_type or ""
+        logger.info(f"收到请求 Content-Type: {content_type}")
         
-        # 如果请求体不为空，按照原来的方式处理
-        if body_bytes:
-            # 获取内容类型
-            content_type = request.headers.get("content-type", "").lower()
+        # 根据内容类型解析请求体
+        if request.data:  # 检查是否有请求体
+            logger.info(f"请求体字节长度: {len(request.data)}")
             
-            # 根据内容类型解析请求体
-            if "application/json" in content_type:
-                try:
-                    body = await request.json()
-                except JSONDecodeError as e:
-                    # 记录原始请求体内容，便于调试
-                    body_str = body_bytes.decode('utf-8')
-                    logger.error(f"JSON解析失败: {str(e)}, 原始请求体: {body_str[:500]}...")
-                    raise HTTPException(status_code=400, detail="请求体不是有效的JSON格式")
-            elif "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
+            if "application/json" in content_type.lower():
+                # 直接使用 request.json 获取 JSON 数据
+                body = request.get_json()
+                if body is None:
+                    logger.error("JSON解析失败，请求体不是有效的JSON格式")
+                    return jsonify({"error": "请求体不是有效的JSON格式"}), 400
+            elif "application/x-www-form-urlencoded" in content_type.lower() or "multipart/form-data" in content_type.lower():
                 # 处理表单数据
-                form_data = await request.form()
-                body = dict(form_data)
+                body = request.form.to_dict()
             else:
-                # 尝试作为JSON解析
+                # 尝试解析为JSON，不管Content-Type是什么
                 try:
-                    body = await request.json()
-                except JSONDecodeError as e:
-                    # 记录原始请求体内容，便于调试
-                    body_str = body_bytes.decode('utf-8')
-                    logger.error(f"JSON解析失败: {str(e)}, Content-Type: {content_type}, 原始请求体: {body_str[:500]}...")
-                    raise HTTPException(status_code=400, detail="请求体不是有效的JSON格式")
-            
-            if "kw" not in body:
-                raise HTTPException(status_code=400, detail="缺少必需字段: kw")
+                    body = request.get_json(force=True)  # 强制解析
+                    if body is None:
+                        # 如果强制解析也失败，尝试手动解码
+                        raw_data = request.data.decode('utf-8')
+                        body = json.loads(raw_data)
+                except Exception as e:
+                    logger.error(f"无法解析请求体: {str(e)}")
+                    return jsonify({"error": "请求体格式错误"}), 400
         else:
             # 请求体为空时，尝试从查询参数中获取kw
-            params = dict(request.query_params)
-            logger.info(f"查询参数: {params}")
+            params = request.args.to_dict()
+            logger.info(f"请求体为空，查询参数: {params}")
             if "kw" not in params or not params["kw"]:
-                raise HTTPException(status_code=400, detail="缺少必需字段: kw")
+                return jsonify({"error": "缺少必需字段: kw"}), 400
             # 构造body对象
             body = {
                 "kw": params["kw"],
                 "res": params.get("res", "merge"),
                 "src": params.get("src", "")
             }
-    except HTTPException:
-        # 如果已经是HTTP异常，直接抛出
-        raise
+            
+        logger.info(f"解析得到的请求体: {body}")
+        if "kw" not in body:
+            return jsonify({"error": "缺少必需字段: kw"}), 400
     except Exception as e:
         logger.error(f"请求参数解析失败: {str(e)}")
-        raise HTTPException(status_code=400, detail=f"请求参数解析失败: {str(e)}")
+        return jsonify({"error": f"请求参数解析失败: {str(e)}"}), 400
 
-    async with httpx.AsyncClient(timeout=60.0, headers={"Content-Type": "application/json; charset=utf-8"}) as client:
+    # 使用同步客户端
+    with httpx.Client(timeout=60.0) as client:
         # 2. 调用原始 pansou 接口获取数据
         try:
-            search_res = await client.post(f"{SEARCH_API_URL}/api/search", json=body)
+            search_res = client.post(f"{SEARCH_API_URL}/api/search", json=body)
             search_res.raise_for_status()  # 确保HTTP状态码正常
 
             # 尝试处理响应内容
             try:
                 # 先获取文本内容，再解析为JSON，以确保正确的字符编码处理
                 content = search_res.text
-                import json
                 search_data = json.loads(content)
-            except JSONDecodeError as e:
-                # 如果JSON解析失败，记录原始响应内容
-                logger.warning(f"搜索API返回的内容不是有效的JSON: {str(e)}, 原始响应: {content[:500]}...")
-                raise HTTPException(status_code=500, detail="搜索API返回的内容格式错误")
             except Exception as e:
-                # 如果其他错误，尝试获取文本内容
-                try:
-                    content = search_res.text
-                    logger.warning(f"搜索API返回的内容不是有效的JSON: {content[:500]}...")
-                    raise HTTPException(status_code=500, detail="搜索API返回的内容格式错误")
-                except Exception:
-                    # 如果文本也获取失败，记录原始响应
-                    logger.error(f"无法解析搜索API响应: {search_res.content}")
-                    raise HTTPException(status_code=500, detail="搜索API返回的内容无法解析")
+                # 如果JSON解析失败，记录原始响应内容
+                logger.warning(f"搜索API返回的内容不是有效的JSON: {str(e)}, 原始响应: {content[:500] if 'content' in locals() else search_res.content[:500]}...")
+                return jsonify({"error": "搜索API返回的内容格式错误"}), 500
 
         except httpx.ConnectError:
             logger.error(f"无法连接到搜索API: {SEARCH_API_URL}")
-            raise HTTPException(status_code=503, detail=f"无法连接到搜索API: {SEARCH_API_URL}")
+            return jsonify({"error": f"无法连接到搜索API: {SEARCH_API_URL}"}), 503
         except httpx.TimeoutException:
             logger.error("搜索API请求超时")
-            raise HTTPException(status_code=408, detail="搜索API请求超时")
+            return jsonify({"error": "搜索API请求超时"}), 408
         except Exception as e:
             logger.error(f"搜索API错误: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"搜索API错误: {str(e)}")
+            return jsonify({"error": f"搜索API错误: {str(e)}"}), 500
 
-        # 使用通用的过滤函数处理结果
+        # 使用过滤函数处理结果
         try:
-            return await filter_search_results(search_data, client, "POST")
+            result = filter_search_results_sync(search_data, client, "POST")
+            response = make_response(jsonify(result))
+            response.headers['Content-Type'] = 'application/json; charset=utf-8'
+            return response
         except Exception as e:
             logger.error(f"过滤结果时发生错误: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"处理搜索结果时发生错误: {str(e)}")
+            return jsonify({"error": f"处理搜索结果时发生错误: {str(e)}"}), 500
 
 
 # 支持 GET 请求透传
-@app.get("/api/search")
-async def proxy_search_get(request: Request):
-    params = dict(request.query_params)
+@app.route('/api/search', methods=['GET'])
+def proxy_search_get():
+    params = request.args.to_dict()
     # 将查询参数转换为适合搜索API的格式
     search_params = {
         "kw": params.get("kw", ""),
@@ -260,103 +253,72 @@ async def proxy_search_get(request: Request):
         "src": params.get("src", "")
     }
 
-    async with httpx.AsyncClient(timeout=60.0, headers={"Content-Type": "application/json; charset=utf-8"}) as client:
+    with httpx.Client(timeout=60.0) as client:
         # 2. 调用原始 pansou 接口获取数据
         try:
-            search_res = await client.get(f"{SEARCH_API_URL}/api/search", params=search_params)
+            search_res = client.get(f"{SEARCH_API_URL}/api/search", params=search_params)
             search_res.raise_for_status()  # 确保HTTP状态码正常
 
             # 尝试处理响应内容
             try:
                 # 先获取文本内容，再解析为JSON，以确保正确的字符编码处理
                 content = search_res.text
-                import json
                 search_data = json.loads(content)
-            except JSONDecodeError as e:
-                # 如果JSON解析失败，记录原始响应内容
-                logger.warning(f"GET请求 - 搜索API返回的内容不是有效的JSON: {str(e)}, 原始响应: {content[:500]}...")
-                raise HTTPException(status_code=500, detail="搜索API返回的内容格式错误")
             except Exception as e:
-                # 如果其他错误，尝试获取文本内容
-                try:
-                    content = search_res.text
-                    logger.warning(f"GET请求 - 搜索API返回的内容不是有效的JSON: {content[:500]}...")
-                    raise HTTPException(status_code=500, detail="搜索API返回的内容格式错误")
-                except Exception:
-                    # 如果文本也获取失败，记录原始响应
-                    logger.error(f"GET请求 - 无法解析搜索API响应: {search_res.content}")
-                    raise HTTPException(status_code=500, detail="搜索API返回的内容无法解析")
+                # 如果JSON解析失败，记录原始响应内容
+                logger.warning(f"GET请求 - 搜索API返回的内容不是有效的JSON: {str(e)}, 原始响应: {search_res.content[:500] if hasattr(search_res, 'content') else 'No content'}...")
+                return jsonify({"error": "搜索API返回的内容格式错误"}), 500
 
         except httpx.ConnectError:
             logger.error(f"无法连接到搜索API: {SEARCH_API_URL}")
-            raise HTTPException(status_code=503, detail=f"无法连接到搜索API: {SEARCH_API_URL}")
+            return jsonify({"error": f"无法连接到搜索API: {SEARCH_API_URL}"}), 503
         except httpx.TimeoutException:
             logger.error("搜索API请求超时")
-            raise HTTPException(status_code=408, detail="搜索API请求超时")
+            return jsonify({"error": "搜索API请求超时"}), 408
         except Exception as e:
             logger.error(f"搜索API错误: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"搜索API错误: {str(e)}")
+            return jsonify({"error": f"搜索API错误: {str(e)}"}), 500
 
-        # 使用通用的过滤函数处理结果
+        # 使用过滤函数处理结果
         try:
-            return await filter_search_results(search_data, client, "GET")
+            result = filter_search_results_sync(search_data, client, "GET")
+            response = make_response(jsonify(result))
+            response.headers['Content-Type'] = 'application/json; charset=utf-8'
+            return response
         except Exception as e:
             logger.error(f"GET请求 - 过滤结果时发生错误: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"处理搜索结果时发生错误: {str(e)}")
+            return jsonify({"error": f"处理搜索结果时发生错误: {str(e)}"}), 500
 
 
-@app.get("/api/health")
-async def health():
+@app.route('/api/health', methods=['GET'])
+def health():
     """pansou健康检查接口"""
-    async with httpx.AsyncClient(timeout=60.0, headers={"Content-Type": "application/json; charset=utf-8"}) as client:
-        # 2. 调用原始 pansou 接口获取数据
+    with httpx.Client(timeout=60.0) as client:
         try:
-            search_res = await client.get(f"{SEARCH_API_URL}/api/health")
+            search_res = client.get(f"{SEARCH_API_URL}/api/health")
             search_res.raise_for_status()  # 确保HTTP状态码正常
             
-            # 尝试处理响应内容
-            try:
-                # 先获取文本内容，再解析为JSON，以确保正确的字符编码处理
-                content = search_res.text
-                import json
-                return json.loads(content)
-            except JSONDecodeError as e:
-                # 如果JSON解析失败，记录原始响应内容
-                logger.warning(f"健康检查API返回的内容不是有效的JSON: {str(e)}, 原始响应: {content[:500]}...")
-                raise HTTPException(status_code=500, detail="健康检查API返回的内容格式错误")
-            except Exception as e:
-                # 如果其他错误，尝试获取文本内容
-                try:
-                    content = search_res.text
-                    logger.warning(f"健康检查API返回的内容不是有效的JSON: {content[:500]}...")
-                    raise HTTPException(status_code=500, detail="健康检查API返回的内容格式错误")
-                except Exception:
-                    # 如果文本也获取失败，记录原始响应
-                    logger.error(f"无法解析健康检查API响应: {search_res.content}")
-                    raise HTTPException(status_code=500, detail="健康检查API返回的内容无法解析")
+            # 直接返回响应内容
+            content = search_res.text
+            data = json.loads(content)
+            response = make_response(jsonify(data))
+            response.headers['Content-Type'] = 'application/json; charset=utf-8'
+            return response
                     
         except httpx.ConnectError:
             logger.error(f"无法连接到健康检查API: {SEARCH_API_URL}")
-            raise HTTPException(status_code=503, detail=f"无法连接到健康检查API: {SEARCH_API_URL}")
+            return jsonify({"error": f"无法连接到健康检查API: {SEARCH_API_URL}"}), 503
         except httpx.TimeoutException:
             logger.error("健康检查API请求超时")
-            raise HTTPException(status_code=408, detail="健康检查API请求超时")
+            return jsonify({"error": "健康检查API请求超时"}), 408
         except Exception as e:
             logger.error(f"健康检查API错误: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"健康检查API错误: {str(e)}")
+            return jsonify({"error": f"健康检查API错误: {str(e)}"}), 500
 
 
 if __name__ == "__main__":
-    import uvicorn
-    import asyncio
-
-    # 使用兼容的方式运行uvicorn
-    config = uvicorn.Config(app, host="0.0.0.0", port=1566)
-    server = uvicorn.Server(config)
-
-    # 在Windows环境下使用兼容的事件循环
-    if os.name == "nt":  # Windows系统
-        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-
-    # 直接运行服务器而不是使用uvicorn.run
-    asyncio.run(server.serve())
+    import os
+    
+    # 使用 Flask 内置开发服务器
+    port = int(os.environ.get("PORT", 1566))
+    app.run(host="0.0.0.0", port=port, debug=False)
