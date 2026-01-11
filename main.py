@@ -2,6 +2,7 @@ import os
 import logging
 import time
 from collections import Counter
+from json import JSONDecodeError
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -151,9 +152,54 @@ async def filter_search_results(search_data, client, request_type="POST"):
 async def proxy_search(request: Request):
     # 1. 获取原始请求参数
     try:
-        body = await request.json()
-        if "kw" not in body:
-            raise HTTPException(status_code=400, detail="缺少必需字段: kw")
+        # 检查请求体是否为空
+        body_bytes = await request.body()
+        
+        # 如果请求体不为空，按照原来的方式处理
+        if body_bytes:
+            # 获取内容类型
+            content_type = request.headers.get("content-type", "").lower()
+            
+            # 根据内容类型解析请求体
+            if "application/json" in content_type:
+                try:
+                    body = await request.json()
+                except JSONDecodeError as e:
+                    # 记录原始请求体内容，便于调试
+                    body_str = body_bytes.decode('utf-8')
+                    logger.error(f"JSON解析失败: {str(e)}, 原始请求体: {body_str[:500]}...")
+                    raise HTTPException(status_code=400, detail="请求体不是有效的JSON格式")
+            elif "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
+                # 处理表单数据
+                form_data = await request.form()
+                body = dict(form_data)
+            else:
+                # 尝试作为JSON解析
+                try:
+                    body = await request.json()
+                except JSONDecodeError as e:
+                    # 记录原始请求体内容，便于调试
+                    body_str = body_bytes.decode('utf-8')
+                    logger.error(f"JSON解析失败: {str(e)}, Content-Type: {content_type}, 原始请求体: {body_str[:500]}...")
+                    raise HTTPException(status_code=400, detail="请求体不是有效的JSON格式")
+            
+            if "kw" not in body:
+                raise HTTPException(status_code=400, detail="缺少必需字段: kw")
+        else:
+            # 请求体为空时，尝试从查询参数中获取kw
+            params = dict(request.query_params)
+            logger.info(f"查询参数: {params}")
+            if "kw" not in params or not params["kw"]:
+                raise HTTPException(status_code=400, detail="缺少必需字段: kw")
+            # 构造body对象
+            body = {
+                "kw": params["kw"],
+                "res": params.get("res", "merge"),
+                "src": params.get("src", "")
+            }
+    except HTTPException:
+        # 如果已经是HTTP异常，直接抛出
+        raise
     except Exception as e:
         logger.error(f"请求参数解析失败: {str(e)}")
         raise HTTPException(status_code=400, detail=f"请求参数解析失败: {str(e)}")
@@ -170,8 +216,12 @@ async def proxy_search(request: Request):
                 content = search_res.text
                 import json
                 search_data = json.loads(content)
+            except JSONDecodeError as e:
+                # 如果JSON解析失败，记录原始响应内容
+                logger.warning(f"搜索API返回的内容不是有效的JSON: {str(e)}, 原始响应: {content[:500]}...")
+                raise HTTPException(status_code=500, detail="搜索API返回的内容格式错误")
             except Exception as e:
-                # 如果JSON解析失败，尝试获取文本内容
+                # 如果其他错误，尝试获取文本内容
                 try:
                     content = search_res.text
                     logger.warning(f"搜索API返回的内容不是有效的JSON: {content[:500]}...")
@@ -222,8 +272,12 @@ async def proxy_search_get(request: Request):
                 content = search_res.text
                 import json
                 search_data = json.loads(content)
+            except JSONDecodeError as e:
+                # 如果JSON解析失败，记录原始响应内容
+                logger.warning(f"GET请求 - 搜索API返回的内容不是有效的JSON: {str(e)}, 原始响应: {content[:500]}...")
+                raise HTTPException(status_code=500, detail="搜索API返回的内容格式错误")
             except Exception as e:
-                # 如果JSON解析失败，尝试获取文本内容
+                # 如果其他错误，尝试获取文本内容
                 try:
                     content = search_res.text
                     logger.warning(f"GET请求 - 搜索API返回的内容不是有效的JSON: {content[:500]}...")
@@ -266,8 +320,12 @@ async def health():
                 content = search_res.text
                 import json
                 return json.loads(content)
+            except JSONDecodeError as e:
+                # 如果JSON解析失败，记录原始响应内容
+                logger.warning(f"健康检查API返回的内容不是有效的JSON: {str(e)}, 原始响应: {content[:500]}...")
+                raise HTTPException(status_code=500, detail="健康检查API返回的内容格式错误")
             except Exception as e:
-                # 如果JSON解析失败，尝试获取文本内容
+                # 如果其他错误，尝试获取文本内容
                 try:
                     content = search_res.text
                     logger.warning(f"健康检查API返回的内容不是有效的JSON: {content[:500]}...")
