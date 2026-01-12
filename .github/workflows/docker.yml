@@ -26,9 +26,10 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push
+      - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
-          platforms: linux/amd64,linux/arm64
           push: true
-          tags: douniwan819/pansou-pancheck:latest
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            yourdockerhubname/pansou-pancheck:latest
