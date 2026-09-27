@@ -8,11 +8,9 @@ from flask import Blueprint, g, jsonify, request
 
 from config import Config
 
-
 auth_bp = Blueprint("auth", __name__)
 
 AUTH_PUBLIC_PATHS = {"/api/auth/login", "/api/auth/logout", "/api/health"}
-
 
 def base64url_encode(data):
     """JWT 使用的 base64url 编码，不带填充符。"""
@@ -78,26 +76,29 @@ def validate_jwt_token(token):
         return None, "invalid"
 
 
-def auth_error(message, status_code=401):
-    """返回认证错误。"""
-    return jsonify({"code": status_code, "message": message}), status_code
+# 与上游 pansou 中间件保持一致的认证错误格式
+def auth_error(message, auth_code, status_code=401):
+    """返回上游 pansou 兼容的认证错误响应。"""
+    return jsonify({"error": message, "code": auth_code}), status_code
 
 
 def authenticate_request():
     """从 Authorization 头验证 Bearer Token。"""
     auth_header = request.headers.get("Authorization", "")
+    if not auth_header:
+        return None, auth_error("未授权：缺少认证令牌", "AUTH_TOKEN_MISSING")
     if not auth_header.startswith("Bearer "):
-        return None, auth_error("缺少认证令牌", 401)
+        return None, auth_error("未授权：令牌格式错误", "AUTH_TOKEN_INVALID_FORMAT")
 
     token = auth_header.removeprefix("Bearer ").strip()
     if not token:
-        return None, auth_error("缺少认证令牌", 401)
+        return None, auth_error("未授权：令牌格式错误", "AUTH_TOKEN_INVALID_FORMAT")
 
     payload, error = validate_jwt_token(token)
     if error == "expired":
-        return None, auth_error("认证令牌已过期", 401)
+        return None, auth_error("未授权：令牌无效或已过期", "AUTH_TOKEN_INVALID")
     if error:
-        return None, auth_error("认证令牌无效", 401)
+        return None, auth_error("未授权：令牌无效或已过期", "AUTH_TOKEN_INVALID")
 
     return payload, None
 
@@ -127,57 +128,50 @@ def auth_middleware():
 
 @auth_bp.route('/api/auth/login', methods=['POST'])
 def auth_login():
-    """认证登录接口。"""
+    """认证登录接口，响应格式与上游 pansou 保持一致（平铺 token/expires_at/username）。"""
     body = request.get_json(silent=True) or {}
     username = str(body.get("username", "")).strip()
     password = str(body.get("password", ""))
 
     if not username or not password:
-        return jsonify({"code": 400, "message": "用户名和密码不能为空"}), 400
+        return jsonify({"error": "参数错误：用户名和密码不能为空"}), 400
+
+    if not Config.AUTH_ENABLED:
+        return jsonify({"error": "认证功能未启用"}), 403
 
     users = Config.get_auth_users()
     if not users:
-        return jsonify({"code": 500, "message": "认证系统未正确配置"}), 500
+        return jsonify({"error": "认证系统未正确配置"}), 500
 
     expected_password = users.get(username)
     if expected_password is None or not hmac.compare_digest(expected_password, password):
-        return jsonify({"code": 401, "message": "用户名或密码错误"}), 401
+        return jsonify({"error": "用户名或密码错误"}), 401
 
     token = generate_jwt_token(username)
+    expires_at = int(time.time()) + Config.AUTH_TOKEN_EXPIRY * 3600
     return jsonify({
-        "code": 0,
-        "message": "登录成功",
-        "data": {
-            "token": token,
-            "expires_in": Config.AUTH_TOKEN_EXPIRY * 3600,
-        },
+        "token": token,
+        "expires_at": expires_at,
+        "username": username,
     })
 
 
-@auth_bp.route('/api/auth/verify', methods=['GET'])
+@auth_bp.route('/api/auth/verify', methods=['POST'])
 def auth_verify():
-    """认证验证接口。"""
+    """认证验证接口，上游 pansou 仅提供 POST，此处与上游保持一致。"""
     if not Config.AUTH_ENABLED:
-        return jsonify({
-            "code": 0,
-            "message": "认证功能未启用",
-            "data": {"valid": True},
-        })
+        return jsonify({"valid": True, "message": "认证功能未启用"})
 
     return jsonify({
-        "code": 0,
-        "message": "令牌有效",
-        "data": {
-            "valid": True,
-            "username": getattr(g, "auth_username", ""),
-        },
+        "valid": True,
+        "username": getattr(g, "auth_username", ""),
     })
 
 
 @auth_bp.route('/api/auth/logout', methods=['POST'])
 def auth_logout():
     """认证登出接口。JWT 无服务端状态，客户端丢弃 token 即可。"""
-    return jsonify({"code": 0, "message": "登出成功"})
+    return jsonify({"message": "退出成功"})
 
 
 def register_auth(app):

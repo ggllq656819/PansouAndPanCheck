@@ -7,7 +7,6 @@ from config import Config
 from pancheck import pancheck_bp
 from proxy import proxy_bp
 
-
 logging.basicConfig(
     level=getattr(logging, Config.LOG_LEVEL),
     format="%(asctime)s - %(levelname)s - %(message)s",

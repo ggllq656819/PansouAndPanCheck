@@ -77,6 +77,9 @@ PansouAndPanCheck/
 | `PANSOU_AUTH_PASSWORD` | 空 | 上游 pansou 登录密码 |
 | `PANSOU_AUTH_TOKEN` | 空 | 可选，上游 pansou 固定 token |
 | `PANSOU_AUTH_LOGIN_URL` | 空 | 可选，自定义上游登录接口路径或完整 URL |
+| `CHECK_LINKS_PASSTHROUGH_ENABLED` | `true` | `/api/check/links` 优先透传上游新版接口 |
+| `CHECK_LINKS_FALLBACK_ENABLED` | `true` | 上游不可用时回退本地 PanCheck 检测 |
+| `CHECK_LINKS_MAX_ITEMS` | `256` | 单次检测链接数量上限，与上游一致 |
 
 启用认证时必须配置固定的 `AUTH_JWT_SECRET`，否则服务启动会失败，避免重启或多进程部署后 token 无法验证。
 
@@ -125,15 +128,16 @@ gunicorn -k gevent -w 2 -b 0.0.0.0:1566 main:app
 
 ## API 接口
 
-### 搜索接口
+### 接口列表
 
-- **POST** `/api/auth/login` - 认证登录
-- **GET** `/api/auth/verify` - 验证令牌
-- **POST** `/api/auth/logout` - 登出
+- **POST** `/api/auth/login` - 认证登录，返回平铺 `{token, expires_at, username}`（与上游 pansou 一致）
+- **POST** `/api/auth/verify` - 验证令牌，返回 `{valid, username}`
+- **POST** `/api/auth/logout` - 登出，返回 `{message}`
 - **POST** `/api/search` - 搜索网盘资源
-- **GET** `/api/search` - 搜索网盘资源（查询参数形式）
-- **POST** `/api/check/links` - 链接有效性检测
-- **GET** `/api/health` - 健康检查
+- **GET** `/api/search` - 搜索网盘资源（查询参数形式，透传 `cloud_types`、`filter` 等新版参数）
+- **POST** `/api/check/links` - 链接有效性检测，优先透传新版上游（支持 `proxy_url`、`view_token`），上游旧版/不可用时回退本地 PanCheck；响应均为平铺 `{results: [...]}`
+- **GET** `/api/health` - 健康检查，透传上游 `liveness`、`tg` 字段
+- **GET/POST** `/gying/<param>`、`/qqpd/<param>`、`/weibo/<param>`、`/panlian/<param>` - 上游插件 Web 管理页代理
 
 ## 日志说明
 

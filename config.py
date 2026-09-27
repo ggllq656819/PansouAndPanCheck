@@ -7,7 +7,6 @@ import secrets
 
 from dotenv import load_dotenv
 
-
 load_dotenv()
 
 
@@ -19,7 +18,7 @@ class Config:
 
     # 应用配置
     PORT = int(os.getenv("PORT", 1566))
-    HOST = os.getenv("HOST", "0.0.0.0")
+    HOST = os.getenv("HOST", "0.0.0.0")  # noqa: S104 - Docker 部署需要对外提供服务，有意绑定全部接口
     DEBUG = os.getenv("DEBUG", "False").lower() == "true"
 
     # 认证配置，与 pansou 保持一致，默认关闭
@@ -39,7 +38,15 @@ class Config:
     CLIENT_TIMEOUT = float(os.getenv("CLIENT_TIMEOUT", 60.0))  # 秒
     MAX_RETRIES = int(os.getenv("MAX_RETRIES", 3))
 
-    # 日志配置
+    # /api/check/links 透传与回退配置
+    # 与上游 pansou 一致的单次检测链接数量上限
+    CHECK_LINKS_MAX_ITEMS = int(os.getenv("CHECK_LINKS_MAX_ITEMS", 256))
+    # 上游 pansou 无 /api/check/links（旧版本）或透传失败时，回退到本地 PanCheck 检测
+    CHECK_LINKS_FALLBACK_ENABLED = os.getenv("CHECK_LINKS_FALLBACK_ENABLED", "true").lower() in ("true", "1", "yes", "on")
+    # /api/check/links 是否优先透传上游新版接口，便于异常时临时关闭
+    CHECK_LINKS_PASSTHROUGH_ENABLED = os.getenv("CHECK_LINKS_PASSTHROUGH_ENABLED", "true").lower() in ("true", "1", "yes", "on")
+
+    # 日志级别（DEBUG, INFO, WARNING, ERROR, CRITICAL）
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
     # 支持的网盘平台

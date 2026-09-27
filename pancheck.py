@@ -7,7 +7,7 @@ import httpx
 from flask import Blueprint, jsonify, request
 
 from config import Config
-
+from pansou_auth import get_pansou_auth_headers
 
 logger = logging.getLogger(__name__)
 pancheck_bp = Blueprint("pancheck", __name__)
@@ -210,7 +210,7 @@ def filter_search_results_sync(search_data, client, request_type="POST"):
         f"过滤后链接数: {len(valid_links_set)}, 过滤掉: {total_filtered_out}"
     )
 
-    for netdisk_type in original_counts.keys():
+    for netdisk_type in original_counts:
         original_count = original_counts[netdisk_type]
         filtered_count = filtered_counts[netdisk_type]
         logger.info(
@@ -231,18 +231,103 @@ def filter_search_results_sync(search_data, client, request_type="POST"):
 
 @pancheck_bp.route('/api/check/links', methods=['POST'])
 def check_links():
-    """链接有效性检测接口，兼容 pansou /api/check/links。"""
+    """链接有效性检测接口。
+
+    新版上游 pansou 自带 /api/check/links（支持 proxy_url 等参数），优先原样透传；
+    上游为旧版本无此接口（404）或透传失败时，回退到本地 PanCheck 检测，
+    回退实现的响应格式也已对齐上游的平铺 results 结构。
+    """
     body = request.get_json(silent=True)
     if not isinstance(body, dict):
         return jsonify({"code": 400, "message": "请求体必须是 JSON 对象"}), 400
 
     items = body.get("items")
     if items is None and isinstance(body.get("links"), list):
-        items = [{"url": link, "disk_type": body.get("disk_type", "")} for link in body.get("links", [])]
+        # 本代理历史兼容格式：上游只认 items，透传前先重写，否则旧调用方请求会被上游 400 拒绝
+        body["items"] = items = [
+            {"url": link, "disk_type": body.get("disk_type", "")}
+            for link in body.get("links", [])
+            if isinstance(link, str)
+        ]
 
     if not isinstance(items, list) or not items:
         return jsonify({"code": 400, "message": "缺少必需字段: items"}), 400
 
+    if len(items) > Config.CHECK_LINKS_MAX_ITEMS:
+        return jsonify({
+            "code": 400,
+            "message": f"items 数量 {len(items)} 超过上限 {Config.CHECK_LINKS_MAX_ITEMS}",
+        }), 400
+
+    # 优先透传新版上游 pansou 的 /api/check/links
+    if is_check_links_passthrough_enabled():
+        upstream_response = try_upstream_check_links(body)
+        # 上游 401 且代理用登录态访问时，刷新 token 后重试一次（与 /api/search 行为一致）
+        if (
+            upstream_response is not None
+            and upstream_response[0] == 401
+            and Config.PANSOU_AUTH_ENABLED
+            and not Config.PANSOU_AUTH_TOKEN
+        ):
+            logger.info("上游 pansou 链接检测返回 401，刷新 token 后重试")
+            upstream_response = try_upstream_check_links(body, force_refresh=True)
+        if upstream_response is not None:
+            status_code, payload = upstream_response
+            response = jsonify(payload)
+            response.status_code = status_code
+            response.headers["Content-Type"] = "application/json; charset=utf-8"
+            return response
+
+    if not Config.CHECK_LINKS_FALLBACK_ENABLED:
+        return jsonify({"code": 502, "message": "上游链接检测不可用，且回退检测已禁用"}), 502
+
+    return check_links_with_pancheck(items)
+
+
+def is_check_links_passthrough_enabled():
+    """透传开关：默认开启，便于异常时临时关闭。"""
+    return Config.CHECK_LINKS_PASSTHROUGH_ENABLED
+
+
+def try_upstream_check_links(body, force_refresh=False):
+    """转发请求到上游 pansou /api/check/links。
+
+    返回 (status_code, payload)；上游 404（旧版本无此接口）或其他可回退错误时
+    返回 None，由调用方走本地回退。上游 4xx（参数错误等）必须原样返回，
+    不能吞掉后重新检测，否则会把上游对 proxy_url 等参数的校验结论丢掉。
+    """
+    url = f"{Config.SEARCH_API_URL.rstrip('/')}/api/check/links"
+    try:
+        with httpx.Client(timeout=Config.CLIENT_TIMEOUT) as client:
+            headers = get_pansou_auth_headers(client, force_refresh=force_refresh) or {}
+            upstream = client.post(url, json=body, headers=headers)
+    except httpx.HTTPError as e:
+        logger.warning(f"上游 pansou 链接检测不可用，回退到本地 PanCheck: {e}")
+        return None
+
+    if upstream.status_code == 404:
+        logger.info("上游 pansou 未提供 /api/check/links（旧版本），回退到本地 PanCheck")
+        return None
+
+    if upstream.status_code >= 500:
+        logger.warning(f"上游 pansou 链接检测返回 {upstream.status_code}，回退到本地 PanCheck")
+        return None
+
+    try:
+        payload = upstream.json()
+    except ValueError:
+        logger.warning("上游 pansou 链接检测返回非 JSON 内容，回退到本地 PanCheck")
+        return None
+
+    if upstream.status_code == 401:
+        # 上游开启了认证且代理未配置 PANSOU_AUTH_*：透传 401，让客户端感知配置缺失
+        logger.warning("上游 pansou 链接检测返回 401，请检查 PANSOU_AUTH_* 配置")
+
+    return upstream.status_code, payload
+
+
+def check_links_with_pancheck(items):
+    """本地 PanCheck 回退实现，响应格式对齐上游 pansou（平铺 results）。"""
     now = int(time.time() * 1000)
     expires_at = now + 24 * 3600 * 1000
     results = [None] * len(items)
@@ -322,10 +407,5 @@ def check_links():
                     )
 
     return jsonify({
-        "code": 0,
-        "message": "success",
-        "data": {
-            "total": len(results),
-            "results": results,
-        },
+        "results": results,
     })

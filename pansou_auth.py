@@ -7,7 +7,6 @@ import httpx
 from auth import get_forward_auth_headers
 from config import Config
 
-
 logger = logging.getLogger(__name__)
 
 _token_lock = threading.RLock()
